@@ -1,0 +1,148 @@
+{
+  "info": {
+    "name": "Spotter Fuel Route Planner",
+    "_postman_id": "6d1f2c4a-5e4b-4b8a-9d0e-0f0e1a2b3c4d",
+    "description": "Django API: US driving route, cheapest fuel stops (500 mi range, 10 MPG) and total fuel cost. Start the server with `python manage.py runserver`, then run the requests in order. Each request has tests (see the Test Results tab).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [{ "key": "baseUrl", "value": "http://127.0.0.1:8000" }],
+  "item": [
+    {
+      "name": "1. Health",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('200 OK', () => pm.response.to.have.status(200));",
+        "pm.test('stations loaded', () => pm.expect(pm.response.json().stations_with_coordinates).to.be.above(6000));"
+      ] } }],
+      "request": { "method": "GET", "url": "{{baseUrl}}/api/health/" }
+    },
+    {
+      "name": "2. Route: Chicago -> Los Angeles",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "const d = pm.response.json();",
+        "pm.test('200 OK', () => pm.response.to.have.status(200));",
+        "pm.test('feasible plan with stops', () => { pm.expect(d.summary.feasible).to.be.true; pm.expect(d.fuel_stops.length).to.be.above(0); });",
+        "pm.test('never more than 500 miles between fills', () => d.fuel_stops.forEach(s => pm.expect(s.range_on_departure_miles).to.be.at.most(500)));",
+        "pm.test('at most one routing call', () => pm.expect(d.external_api_calls.routing).to.be.at.most(1));",
+        "pm.test('route geometry returned', () => pm.expect(d.route.geometry.type).to.eql('LineString'));",
+        "console.log(`Total fuel cost $${d.summary.total_fuel_cost_usd} with ${d.summary.number_of_stops} stops; open ${d.map_url}`);"
+      ] } }],
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=Chicago, IL&finish=Los Angeles, CA",
+          "host": ["{{baseUrl}}"], "path": ["api", "route", ""],
+          "query": [{ "key": "start", "value": "Chicago, IL" }, { "key": "finish", "value": "Los Angeles, CA" }]
+        }
+      }
+    },
+    {
+      "name": "3. Same route again (cached: 0 external calls)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "const d = pm.response.json();",
+        "pm.test('no external calls on repeat', () => pm.expect(d.external_api_calls.geocoding + d.external_api_calls.routing).to.eql(0));",
+        "pm.test('fast', () => pm.expect(pm.response.responseTime).to.be.below(1000));"
+      ] } }],
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=Chicago, IL&finish=Los Angeles, CA",
+          "host": ["{{baseUrl}}"], "path": ["api", "route", ""],
+          "query": [{ "key": "start", "value": "Chicago, IL" }, { "key": "finish", "value": "Los Angeles, CA" }]
+        }
+      }
+    },
+    {
+      "name": "4. Route as GeoJSON (paste into geojson.io)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "const d = pm.response.json();",
+        "pm.test('FeatureCollection', () => pm.expect(d.type).to.eql('FeatureCollection'));",
+        "pm.test('has route and fuel stops', () => { const k = d.features.map(f => f.properties.kind); pm.expect(k).to.include('route'); pm.expect(k).to.include('fuel_stop'); });"
+      ] } }],
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=New York, NY&finish=Miami, FL&output=geojson",
+          "host": ["{{baseUrl}}"], "path": ["api", "route", ""],
+          "query": [{ "key": "start", "value": "New York, NY" }, { "key": "finish", "value": "Miami, FL" }, { "key": "output", "value": "geojson" }]
+        }
+      }
+    },
+    {
+      "name": "5. POST with custom vehicle (start with 1/4 tank, pure cheapest)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('200 OK', () => pm.response.to.have.status(200));",
+        "pm.test('assumptions echoed', () => pm.expect(pm.response.json().assumptions.initial_range_miles).to.eql(125));"
+      ] } }],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/api/route/",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"start\": \"Seattle, WA\",\n  \"finish\": \"Boston, MA\",\n  \"vehicle_range_miles\": 500,\n  \"mpg\": 10,\n  \"initial_range_miles\": 125,\n  \"stop_penalty_usd\": 0,\n  \"include_geometry\": false\n}"
+        }
+      }
+    },
+    {
+      "name": "6. Coordinates input",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=32.7767,-96.7970&finish=39.7392,-104.9903&include_geometry=false",
+          "host": ["{{baseUrl}}"], "path": ["api", "route", ""],
+          "query": [{ "key": "start", "value": "32.7767,-96.7970" }, { "key": "finish", "value": "39.7392,-104.9903" }, { "key": "include_geometry", "value": "false" }]
+        }
+      }
+    },
+    {
+      "name": "7. City suggestions",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('Chicago first', () => pm.expect(pm.response.json().results[0].label).to.eql('Chicago, IL'));"
+      ] } }],
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/places/?q=chi",
+          "host": ["{{baseUrl}}"], "path": ["api", "places", ""],
+          "query": [{ "key": "q", "value": "chi" }]
+        }
+      }
+    },
+    {
+      "name": "8. Error: outside the USA (400)",
+      "event": [{ "listen": "test", "script": { "exec": ["pm.test('400', () => pm.response.to.have.status(400));"] } }],
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=Paris, France&finish=Berlin, Germany",
+          "host": ["{{baseUrl}}"], "path": ["api", "route", ""],
+          "query": [{ "key": "start", "value": "Paris, France" }, { "key": "finish", "value": "Berlin, Germany" }]
+        }
+      }
+    },
+    {
+      "name": "9. Error: no road route, Hawaii (422)",
+      "event": [{ "listen": "test", "script": { "exec": ["pm.test('422', () => pm.response.to.have.status(422));"] } }],
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=Honolulu, HI&finish=Chicago, IL",
+          "host": ["{{baseUrl}}"], "path": ["api", "route", ""],
+          "query": [{ "key": "start", "value": "Honolulu, HI" }, { "key": "finish", "value": "Chicago, IL" }]
+        }
+      }
+    },
+    {
+      "name": "10. Error: missing finish (400)",
+      "event": [{ "listen": "test", "script": { "exec": ["pm.test('400', () => pm.response.to.have.status(400));"] } }],
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/api/route/?start=Chicago, IL",
+          "host": ["{{baseUrl}}"], "path": ["api", "route", ""],
+          "query": [{ "key": "start", "value": "Chicago, IL" }]
+        }
+      }
+    }
+  ]
+}
