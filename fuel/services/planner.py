@@ -1,38 +1,22 @@
 """Orchestrates geocoding -> routing -> station lookup -> fuel optimisation."""
 import time
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode
 
 import numpy as np
 from django.conf import settings
-from django.db import close_old_connections, connections
 
-from .geo import thin_polyline
+from .geo import haversine_miles, thin_polyline
 from .geocoding import geocode
 from .optimizer import plan_fuel_stops
 from .routing import get_route
 from .stations import get_station_index
 
-
-def _geocode_in_thread(query, counter):
-    """Run geocode() in a worker thread; that thread gets (and must close) its own DB connection."""
-    try:
-        close_old_connections()
-        return geocode(query, counter=counter)
-    finally:
-        connections.close_all()
+# Start and finish closer than this are treated as the same place.
+SAME_PLACE_MILES = 1.0
 
 
-def _geocode_pair(start, finish, calls):
-    counters = ({}, {})
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fa = pool.submit(_geocode_in_thread, start, counters[0])
-        fb = pool.submit(_geocode_in_thread, finish, counters[1])
-        try:
-            origin, destination = fa.result(), fb.result()
-        finally:
-            calls["geocoding"] += counters[0].get("geocoding", 0) + counters[1].get("geocoding", 0)
-    return origin, destination
+class TripError(ValueError):
+    """The request is valid input but not a plannable trip (e.g. start == finish)."""
 
 
 def plan_trip(start, finish, *, vehicle_range_miles=None, mpg=None, initial_range_miles=None,
@@ -48,7 +32,12 @@ def plan_trip(start, finish, *, vehicle_range_miles=None, mpg=None, initial_rang
     timings = {}
     calls = {"geocoding": 0, "routing": 0}
 
-    origin, destination = _geocode_pair(start, finish, calls)
+    # Sequential on purpose: most inputs resolve offline, and the public geocoder
+    # allows only one request per second anyway.
+    origin = geocode(start, counter=calls)
+    destination = geocode(finish, counter=calls)
+    if haversine_miles(origin.latitude, origin.longitude, destination.latitude, destination.longitude) < SAME_PLACE_MILES:
+        raise TripError(f"'{start}' and '{finish}' are the same place. Please choose two different locations.")
     t1 = time.perf_counter()
     timings["geocoding_ms"] = round((t1 - t0) * 1000, 1)
 

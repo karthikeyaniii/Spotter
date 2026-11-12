@@ -2,7 +2,8 @@
 Geocode the user's start / finish inputs.
 
 Order of resolution:
-  1. "lat,lon" literal (no external call)
+  1. "lat,lon" literal: a quick bounding-box test, then one reverse lookup
+     (cached) to confirm the point is in the USA and not e.g. Toronto
   2. bundled US place list, e.g. "Chicago, IL" (no external call)
   3. persistent DB cache (GeocodeCache) -> no external call on repeat queries
   4. Nominatim (OpenStreetMap), restricted to the USA
@@ -21,6 +22,7 @@ from django.conf import settings
 
 from fuel.models import GeocodeCache
 
+from .http import polite_get
 from .places import get_place_index
 
 log = logging.getLogger(__name__)
@@ -59,12 +61,6 @@ def _in_us_bounds(lat, lon):
     return lat0 <= lat <= lat1 and lon0 <= lon <= lon1
 
 
-def _session():
-    s = requests.Session()
-    s.headers["User-Agent"] = _cfg("USER_AGENT")
-    return s
-
-
 def _nominatim(query):
     url = _cfg("NOMINATIM_BASE_URL").rstrip("/") + "/search"
     params = {
@@ -74,7 +70,7 @@ def _nominatim(query):
         "countrycodes": "us",
         "addressdetails": 1,
     }
-    r = _session().get(url, params=params, timeout=_cfg("GEOCODER_TIMEOUT_SECONDS"))
+    r = polite_get(url, params=params, timeout=_cfg("GEOCODER_TIMEOUT_SECONDS"))
     r.raise_for_status()
     data = r.json()
     if not data:
@@ -87,7 +83,7 @@ def _nominatim(query):
 
 def _photon(query):
     url = _cfg("PHOTON_BASE_URL").rstrip("/") + "/api/"
-    r = _session().get(url, params={"q": query, "limit": 5}, timeout=_cfg("GEOCODER_TIMEOUT_SECONDS"))
+    r = polite_get(url, params={"q": query, "limit": 5}, timeout=_cfg("GEOCODER_TIMEOUT_SECONDS"))
     r.raise_for_status()
     for feat in r.json().get("features", []):
         props = feat.get("properties", {})
@@ -97,6 +93,39 @@ def _photon(query):
         parts = [props.get(k) for k in ("name", "city", "state", "country") if props.get(k)]
         return Place(query, ", ".join(dict.fromkeys(parts)), float(lat), float(lon), "photon")
     return None
+
+
+def _reverse_country(lat, lon):
+    """Country code of a point via Nominatim reverse geocoding (country-level zoom)."""
+    url = _cfg("NOMINATIM_BASE_URL").rstrip("/") + "/reverse"
+    params = {"lat": f"{lat:.6f}", "lon": f"{lon:.6f}", "format": "jsonv2", "zoom": 3, "addressdetails": 1}
+    r = polite_get(url, params=params, timeout=_cfg("GEOCODER_TIMEOUT_SECONDS"))
+    r.raise_for_status()
+    return (r.json().get("address") or {}).get("country_code", "")
+
+
+def _check_coordinates(query, lat, lon, counter):
+    """The bounding box also covers parts of Canada and Mexico, so confirm the country once."""
+    if not _in_us_bounds(lat, lon):
+        raise GeocodingError(f"Coordinates {lat},{lon} are outside the United States.")
+    key = f"rev:{lat:.4f},{lon:.4f}"
+    cached = GeocodeCache.objects.filter(query=key).first()
+    if cached:
+        country = cached.provider
+    else:
+        try:
+            if counter is not None:
+                counter["geocoding"] = counter.get("geocoding", 0) + 1
+            country = _reverse_country(lat, lon)
+        except (requests.RequestException, ValueError) as exc:
+            # Service down: fall back to the bounding box rather than fail the request.
+            log.warning("reverse geocode failed for %s: %s", query, exc)
+            return
+        GeocodeCache.objects.get_or_create(
+            query=key, defaults={"display_name": country, "latitude": lat, "longitude": lon, "provider": country}
+        )
+    if country and country != "us":
+        raise GeocodingError(f"Coordinates {lat},{lon} are outside the United States.")
 
 
 def geocode(query, *, counter=None):
@@ -111,8 +140,7 @@ def geocode(query, *, counter=None):
     m = _LATLON_RE.match(query)
     if m:
         lat, lon = float(m.group(1)), float(m.group(2))
-        if not _in_us_bounds(lat, lon):
-            raise GeocodingError(f"Coordinates {lat},{lon} are outside the United States.")
+        _check_coordinates(query, lat, lon, counter)
         return Place(query, f"{lat:.5f}, {lon:.5f}", lat, lon, "coordinates")
 
     local = get_place_index().resolve(query)

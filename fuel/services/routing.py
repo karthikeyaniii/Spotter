@@ -1,7 +1,8 @@
 """
 Driving route between two points using the public OSRM demo server
-(free, no API key). Exactly one HTTP call per route; results are cached
-in-process so a repeated request makes zero external calls.
+(free, no API key). Exactly one HTTP call per route; results go to the
+Django cache (file-based by default, so they survive restarts and are shared
+by worker processes), so a repeated request makes zero external calls.
 """
 import hashlib
 import logging
@@ -13,6 +14,7 @@ from django.conf import settings
 from django.core.cache import cache
 
 from .geo import cumulative_distances
+from .http import polite_get
 
 log = logging.getLogger(__name__)
 METERS_PER_MILE = 1609.344
@@ -53,12 +55,7 @@ def get_route(start_lat, start_lon, end_lat, end_lon, *, counter=None):
     if counter is not None:
         counter["routing"] = counter.get("routing", 0) + 1
     try:
-        r = requests.get(
-            url,
-            params=params,
-            headers={"User-Agent": settings.FUEL_ROUTE["USER_AGENT"]},
-            timeout=settings.FUEL_ROUTE["HTTP_TIMEOUT_SECONDS"],
-        )
+        r = polite_get(url, params=params, timeout=settings.FUEL_ROUTE["HTTP_TIMEOUT_SECONDS"])
     except requests.RequestException as exc:
         raise RoutingError(f"Routing service unavailable: {exc}") from exc
     try:

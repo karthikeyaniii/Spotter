@@ -341,7 +341,14 @@
       const d = await r.json().catch(() => ({}));
       if (!r.ok) {
         const details = typeof d.details === 'string' ? d.details : Object.values(d.details || {}).flat().join(' ');
-        const tip = r.status === 400 ? 'Check the spelling, or use "City, ST" (for example "Dallas, TX").' : 'Please try again in a moment.';
+        const tips = {
+          'Location not found': 'Check the spelling, or use "City, ST" (for example "Dallas, TX").',
+          'Invalid request': 'Check the values in Vehicle settings.',
+          'Invalid trip': '',
+          'No drivable route': 'Both places must be reachable by road (Hawaii is not).',
+          'Too many requests': '',
+        };
+        const tip = d.error in tips ? tips[d.error] : 'Please try again in a moment.';
         showError(d.error || 'Something went wrong', `${details} ${tip}`);
         layer.clearLayers();
         return;

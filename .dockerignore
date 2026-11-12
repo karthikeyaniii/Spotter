@@ -1,0 +1,11 @@
+.venv/
+.git/
+.cache/
+__pycache__/
+*.pyc
+db.sqlite3
+staticfiles/
+data/*.log
+data/sample_response.json
+data/city_coords.nominatim_backup.json
+.env

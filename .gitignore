@@ -12,3 +12,4 @@ data/sample_response.json
 .vscode/
 .idea/
 data/city_coords.nominatim_backup.json
+.cache/

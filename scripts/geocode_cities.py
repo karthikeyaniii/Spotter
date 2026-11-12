@@ -41,9 +41,10 @@ def lookup(city, state):
     return None
 
 
-def main():
-    csv_path = sys.argv[1] if len(sys.argv) > 1 else "data/fuel-prices-for-be-assessment.csv"
-    out_path = sys.argv[2] if len(sys.argv) > 2 else "data/city_coords.json"
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    csv_path = argv[0] if len(argv) > 0 else "data/fuel-prices-for-be-assessment.csv"
+    out_path = argv[1] if len(argv) > 1 else "data/city_coords.json"
     cache = {}
     if os.path.exists(out_path):
         with open(out_path, encoding="utf-8") as f:

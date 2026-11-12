@@ -122,11 +122,27 @@ class RouteApiTests(TestCase):
 
 
 class GeocodeServiceTests(TestCase):
-    def test_lat_lon_literal_needs_no_external_call(self):
+    def test_lat_lon_literal_is_confirmed_once_then_cached(self):
         calls = {}
-        place = geocode("41.88,-87.63", counter=calls)
+        with patch("fuel.services.geocoding._reverse_country", return_value="us") as rev:
+            place = geocode("41.88,-87.63", counter=calls)
+            geocode("41.88,-87.63", counter=calls)
         self.assertEqual((place.latitude, place.longitude), (41.88, -87.63))
-        self.assertEqual(calls, {})
+        self.assertEqual(rev.call_count, 1)  # second time from the DB cache
+        self.assertEqual(calls, {"geocoding": 1})
+
+    def test_lat_lon_in_canada_rejected(self):
+        # Toronto is inside the rough US bounding box, so the country check must catch it.
+        with patch("fuel.services.geocoding._reverse_country", return_value="ca"):
+            with self.assertRaises(GeocodingError):
+                geocode("43.6532,-79.3832")
+
+    def test_lat_lon_accepted_when_reverse_service_is_down(self):
+        import requests
+
+        with patch("fuel.services.geocoding._reverse_country", side_effect=requests.ConnectionError("down")):
+            place = geocode("41.88,-87.63")
+        self.assertEqual(place.provider, "coordinates")
 
     def test_lat_lon_outside_usa_rejected(self):
         with self.assertRaises(GeocodingError):

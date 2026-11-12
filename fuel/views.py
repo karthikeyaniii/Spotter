@@ -1,5 +1,7 @@
 import logging
+from urllib.parse import urlencode
 
+from django.conf import settings
 from django.shortcuts import render
 from django.urls import reverse
 from rest_framework import serializers, status
@@ -9,7 +11,7 @@ from rest_framework.views import APIView
 from .models import FuelStation
 from .services.geocoding import GeocodingError
 from .services.places import get_place_index
-from .services.planner import plan_trip, to_geojson
+from .services.planner import TripError, plan_trip, to_geojson
 from .services.routing import NoRouteError, RoutingError
 from .services.stations import get_station_index
 
@@ -32,10 +34,12 @@ class RouteRequestSerializer(serializers.Serializer):
                                      help_text="'geojson' returns a FeatureCollection you can paste into geojson.io.")
 
     def validate(self, attrs):
-        rng = attrs.get("vehicle_range_miles")
+        rng = attrs.get("vehicle_range_miles", settings.FUEL_ROUTE["VEHICLE_RANGE_MILES"])
         init = attrs.get("initial_range_miles")
-        if rng is not None and init is not None and init > rng:
-            raise serializers.ValidationError("initial_range_miles cannot exceed vehicle_range_miles.")
+        if init is not None and init > rng:
+            raise serializers.ValidationError(
+                f"initial_range_miles ({init:g}) cannot exceed the vehicle's range ({rng:g} miles)."
+            )
         if attrs["start"].strip().lower() == attrs["finish"].strip().lower():
             raise serializers.ValidationError("start and finish must be different locations.")
         return attrs
@@ -49,6 +53,8 @@ class RoutePlanView(APIView):
     POST /api/route/  {"start": "Chicago, IL", "finish": "Los Angeles, CA"}
     Add output=geojson for a map-ready FeatureCollection.
     """
+
+    throttle_scope = "route"
 
     def get(self, request):
         return self._plan(request, request.query_params)
@@ -82,6 +88,8 @@ class RoutePlanView(APIView):
             )
         except GeocodingError as exc:
             return Response({"error": "Location not found", "details": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except TripError as exc:
+            return Response({"error": "Invalid trip", "details": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except NoRouteError as exc:
             return Response({"error": "No drivable route", "details": str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
         except RoutingError as exc:
@@ -93,6 +101,8 @@ class RoutePlanView(APIView):
 
 class PlaceSuggestView(APIView):
     """GET /api/places/?q=chi -> US city suggestions (offline, no external calls)."""
+
+    throttle_scope = "places"
 
     def get(self, request):
         q = request.query_params.get("q", "").strip()[:100]
@@ -119,17 +129,19 @@ class HealthView(APIView):
 class ApiRootView(APIView):
     def get(self, request):
         u = request.build_absolute_uri
+        trip = {"start": "Chicago, IL", "finish": "Los Angeles, CA"}
         return Response(
             {
                 "name": "Fuel Route Planner API",
                 "endpoints": {
-                    "plan_route": u(reverse("fuel:route")) + "?start=Chicago, IL&finish=Los Angeles, CA",
-                    "plan_route_geojson": u(reverse("fuel:route")) + "?start=Chicago, IL&finish=Los Angeles, CA&output=geojson",
+                    "plan_route": u(reverse("fuel:route")) + "?" + urlencode(trip),
+                    "plan_route_geojson": u(reverse("fuel:route")) + "?" + urlencode({**trip, "output": "geojson"}),
                     "place_suggestions": u(reverse("fuel:places")) + "?q=chi",
                     "health": u(reverse("fuel:health")),
                     "map_ui": u("/"),
                 },
-                "defaults": {"vehicle_range_miles": 500, "mpg": 10},
+                "defaults": {"vehicle_range_miles": settings.FUEL_ROUTE["VEHICLE_RANGE_MILES"],
+                             "mpg": settings.FUEL_ROUTE["MPG"]},
             }
         )
 

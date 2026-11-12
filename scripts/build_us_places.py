@@ -43,8 +43,8 @@ def load_population(path):
     return pop
 
 
-def main():
-    args = sys.argv[1:]
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
     pop_path = None
     if "--population" in args:
         i = args.index("--population")

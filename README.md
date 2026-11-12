@@ -9,7 +9,7 @@ Give it a **start** and a **finish** anywhere in the USA. It returns:
 using the supplied truck‑stop price list (`data/fuel-prices-for-be-assessment.csv`) and free,
 key‑less map services.
 
-![Stack](https://img.shields.io/badge/Django-6.1-0C4B33) ![Tests](https://img.shields.io/badge/tests-33%20passing-brightgreen)
+![Stack](https://img.shields.io/badge/Django-6.1-0C4B33) ![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)
 
 ---
 
@@ -26,11 +26,13 @@ key‑less map services.
 | Free map / routing API | OSRM for routing; offline US Census place list, Nominatim and Photon for locations; Esri/OSM map tiles. No keys. |
 | Latest stable Django | Django 6.1.3 (+ Django REST Framework). |
 | Fast responses | ~20–70 ms of our own work for a coast‑to‑coast route; a repeated trip returns in ~90 ms with zero external calls. |
-| Few calls to the map/routing API (1 ideal) | **1 call** for "City, ST" inputs: cities resolve from a bundled Census list, so only the route is fetched. At most 3 for street addresses; repeats are cached (0 calls). Every response reports `external_api_calls`. |
+| Few calls to the map/routing API (1 ideal) | **1 call** for "City, ST" inputs: cities resolve from a bundled Census list, so only the route is fetched. At most 3 for street addresses or coordinates; repeats are cached (0 calls). Every response reports `external_api_calls`. Calls are spaced to the public services' 1‑request‑per‑second policy, and the API itself is rate‑limited per client. |
 
 ---
 
 ## Quick start
+
+**Requires Python 3.12 or newer** (Django 6.1 does not install on older versions).
 
 ```bash
 python -m venv .venv
@@ -109,9 +111,19 @@ POST takes the same fields as JSON. Example response (New York → Los Angeles, 
 }
 ```
 
-**Errors** use plain‑language messages: `400` invalid input or place not found in the USA,
-`422` no drivable road route (e.g. Hawaii → mainland), `502` routing service down, `503` price
-data not loaded. If no chain of stations can cover a gap longer than the tank, the response is
+**Errors** are always JSON, `{"error": ..., "details": ...}`, in plain language:
+
+| Status | When |
+|---|---|
+| 400 | Invalid input, a place not found in the USA, start and finish are the same place, or starting fuel larger than the tank |
+| 404 | Unknown `/api/...` URL |
+| 422 | No drivable road route (e.g. Hawaii → mainland) |
+| 429 | Rate limit reached (default 30 route plans per minute per client) |
+| 500 | Unexpected error (logged on the server; no traceback is sent) |
+| 502 | The routing service is down |
+| 503 | Price data not loaded |
+
+ If no chain of stations can cover a gap longer than the tank, the response is
 `200` with `summary.feasible = false` and the mile where the vehicle would run dry.
 
 ### Other endpoints
@@ -127,7 +139,7 @@ data not loaded. If no chain of stations can cover a gap longer than the tank, t
 
 ```
 request ─► resolve start/finish ─► OSRM route (1 call) ─► stations near route ─► optimal stops ─► JSON / GeoJSON / map
-           offline Census list,     cached in process      KD-tree, ~13 ms        dynamic programme, ~25 ms
+           offline Census list,     file cache             KD-tree, ~13 ms        dynamic programme, ~25 ms
            then DB cache, Nominatim,
            Photon
 ```
@@ -135,9 +147,12 @@ request ─► resolve start/finish ─► OSRM route (1 call) ─► stations n
 1. **Locations** (`fuel/services/places.py`, `geocoding.py`). "City, ST", "City State",
    "City ST 12345" and unambiguous bare city names ("Nashville") resolve from a bundled list of
    31,828 US places (Census Gazetteer + population estimates), with no network call. Street
-   addresses and ambiguous names ("Springfield") fall back to Nominatim, then Photon. Results
-   are cached in the database and must be inside the USA.
-2. **Route** (`routing.py`). One request to the public OSRM server, cached in process.
+   addresses and ambiguous names ("Springfield") fall back to Nominatim, then Photon (only if
+   Nominatim fails). `lat,lon` input is checked with one cached reverse lookup, because a
+   simple bounding box would also accept Toronto or Vancouver. Results are cached in the
+   database and must be inside the USA.
+2. **Route** (`routing.py`). One request to the public OSRM server. Routes are kept in the
+   Django cache (file‑based: survives restarts, shared by worker processes).
 3. **Stations near the route** (`stations.py`). The route is sampled about every mile into a
    SciPy KD‑tree of 3D unit vectors; one query gives each station's nearest route point within
    `max_detour_miles`, which yields its mile marker and detour. Exact great‑circle distances.
@@ -170,10 +185,46 @@ changes, then `python manage.py load_fuel_prices`.
 
 ## Configuration
 
-Everything works with no configuration. Optional environment variables (see `.env.example`):
-`VEHICLE_RANGE_MILES`, `VEHICLE_MPG`, `MAX_DETOUR_MILES`, `STOP_PENALTY_USD`,
-`OSRM_BASE_URL` (e.g. a self‑hosted OSRM), `NOMINATIM_BASE_URL`, `PHOTON_BASE_URL`,
-`GEOCODER_TIMEOUT_SECONDS`, `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`.
+Everything works with no configuration for local use. Optional environment variables
+(see `.env.example`):
+
+* Vehicle: `VEHICLE_RANGE_MILES`, `VEHICLE_MPG`, `MAX_DETOUR_MILES`, `STOP_PENALTY_USD`.
+* Services: `OSRM_BASE_URL` (e.g. a self‑hosted OSRM), `NOMINATIM_BASE_URL`, `PHOTON_BASE_URL`,
+  `GEOCODER_TIMEOUT_SECONDS`.
+* API limits: `THROTTLE_ROUTE` (default `30/minute`), `THROTTLE_PLACES` (default `240/minute`).
+* Django: `DJANGO_DEBUG`, `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS`,
+  `DJANGO_CSRF_TRUSTED_ORIGINS`, `DJANGO_CACHE_DIR`, `DJANGO_HSTS_PRELOAD`, `LOG_LEVEL`.
+
+## Production
+
+```bash
+docker build -t fuel-route-planner .
+docker run -p 8000:8000 -e DJANGO_SECRET_KEY=<random> -e DJANGO_ALLOWED_HOSTS=your.domain fuel-route-planner
+```
+
+The image runs gunicorn with WhiteNoise for static files and runs `migrate` (which loads the
+price list) on start. With `DJANGO_DEBUG=0` the app refuses to start without
+`DJANGO_SECRET_KEY` and turns on HTTPS redirects, HSTS and secure cookies; it passes
+`manage.py check --deploy`. CI (`.github/workflows/ci.yml`) runs the Django checks, a
+migrations check, the test suite and the deploy checklist on every push.
+
+## Design decisions and known limits
+
+* **Public map services.** OSRM and Nominatim demo servers allow 1 request per second. Calls
+  are spaced per host inside each process, the API is throttled per client, and most inputs
+  never reach them (offline cities, caches). For real traffic, set `OSRM_BASE_URL` /
+  `NOMINATIM_BASE_URL` to self‑hosted instances; the limiter is per process.
+* **Station positions are city‑level.** The price file has no coordinates, so a station is
+  placed at its town; the 10‑mile corridor absorbs that. Detour distance is reported but not
+  charged as fuel.
+* **Stop penalty.** "Optimal" defaults to "cheapest, but don't stop to save under $10"; the
+  exact optimum is always reported and is one parameter away.
+* **SQLite** is enough for a read‑mostly 6,600‑row table; move to Postgres via `DATABASES`
+  if the data grows or writes become concurrent.
+* **Station data refresh.** Each process re‑checks the stations table every 30 seconds, so
+  `load_fuel_prices` takes effect without a restart.
+* **API versioning.** The API is unversioned (`/api/`); add `/api/v2/` alongside it before
+  making breaking changes.
 
 ## Project layout
 
@@ -181,6 +232,7 @@ Everything works with no configuration. Optional environment variables (see `.en
 config/                     Django project (settings, urls)
 fuel/
   models.py                 FuelStation, GeocodeCache
+  exceptions.py             JSON error responses
   views.py, urls.py         /api/route/, /api/places/, /api/health/, /api/ and the map page
   services/
     places.py               offline US place lookup + suggestions
@@ -189,12 +241,14 @@ fuel/
     stations.py             KD-tree search for stations along a route
     optimizer.py            dynamic programme (+ reference greedy)
     planner.py              orchestration, response and GeoJSON assembly
+    http.py                 pooled HTTP session + per-host rate limiter
     importer.py             CSV -> database (used by migrate and load_fuel_prices)
   migrations/0002_...       loads the price list on migrate
   management/commands/      load_fuel_prices, geocode_station_cities
   templates/fuel/map.html   the map page (Leaflet)
-  tests/                    33 tests; external services are mocked
+  tests/                    43 tests; the network is blocked inside tests
 data/                       price CSV, station coordinates, US place list
+Dockerfile, .github/        production image and CI
 postman/                    Postman collection
 scripts/                    one-off data builders (Census + Nominatim)
 ```

@@ -9,6 +9,7 @@ great-circle distance, so the result is exact and takes a few milliseconds even
 for coast-to-coast routes.
 """
 import threading
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -119,19 +120,39 @@ class StationIndex:
 
 
 # ---------------------------------------------------------------- singleton
+# The index is cached per process. A cheap fingerprint of the table is checked at
+# most every FINGERPRINT_TTL seconds, so `load_fuel_prices` run from another
+# process (or a new deploy's migration) is picked up without restarting the server.
+FINGERPRINT_TTL = 30.0
 _lock = threading.Lock()
 _index = None
+_fingerprint = None
+_checked_at = 0.0
+
+
+def _db_fingerprint():
+    from django.db.models import Count, Max
+
+    agg = FuelStation.objects.aggregate(n=Count("id"), last=Max("id"))
+    return agg["n"], agg["last"]
 
 
 def get_station_index(force_reload=False):
-    global _index
+    global _index, _fingerprint, _checked_at
     with _lock:
-        if _index is None or force_reload:
+        now = time.monotonic()
+        if _index is not None and not force_reload and now - _checked_at < FINGERPRINT_TTL:
+            return _index
+        fp = _db_fingerprint()
+        _checked_at = now
+        if _index is None or force_reload or fp != _fingerprint:
             _index = StationIndex.from_db()
+            _fingerprint = fp
         return _index
 
 
 def invalidate_station_index():
-    global _index
+    global _index, _fingerprint
     with _lock:
         _index = None
+        _fingerprint = None

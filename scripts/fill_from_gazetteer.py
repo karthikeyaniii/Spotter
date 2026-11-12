@@ -70,9 +70,10 @@ def load_gazetteer(path):
     return {k: max(v) for k, v in index.items() if len(v) == 1}
 
 
-def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    check = "--check" in sys.argv
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = [a for a in argv if not a.startswith("--")]
+    check = "--check" in argv
     gaz_path = args[0]
     csv_path = args[1] if len(args) > 1 else "data/fuel-prices-for-be-assessment.csv"
     out_path = args[2] if len(args) > 2 else "data/city_coords.json"
