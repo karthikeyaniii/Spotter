@@ -1,0 +1,91 @@
+# Production-style stack: nginx -> 3 web replicas -> PostgreSQL + Redis.
+#   cp .env.production.example .env   (then set the secrets)
+#   docker compose up -d --build
+#   docker compose up -d --scale web=5   (scale out; nginx picks new replicas up)
+name: fuel-route-planner
+
+x-app-env: &app-env
+  DJANGO_DEBUG: "0"
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+  # TLS terminates in front of nginx in a real deployment; plain HTTP locally.
+  DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-0}
+  DJANGO_NUM_PROXIES: "1"
+  DATABASE_URL: postgres://fuel:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/fuel
+  DB_POOL_MAX: "3"  # sync workers run one request at a time
+  REDIS_URL: redis://redis:6379/0
+  THROTTLE_ROUTE: ${THROTTLE_ROUTE:-30/minute}
+  THROTTLE_PLACES: ${THROTTLE_PLACES:-240/minute}
+  # Per replica: 4 sync worker processes on a 2-CPU limit (see gunicorn.conf.py).
+  WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: fuel
+      POSTGRES_USER: fuel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    # 3 replicas x 4 workers x pool of up to 3 = 36 connections, plenty of headroom to scale out.
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fuel -d fuel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    # Pure cache: bounded memory, evict least-recently-used keys, no persistence needed.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    image: fuel-route-planner:latest
+    environment: *app-env
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    depends_on:
+      db: {condition: service_healthy}
+    restart: "no"
+
+  web:
+    image: fuel-route-planner:latest
+    environment: *app-env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    deploy:
+      replicas: ${WEB_REPLICAS:-3}
+      resources:
+        limits: {cpus: "2", memory: 1G}
+    stop_grace_period: 35s
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.29-alpine
+    environment:
+      NGINX_API_RATE: ${NGINX_API_RATE:-20r/s}
+    volumes:
+      - ./deploy/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports: ["${HTTP_PORT:-8080}:80"]
+    depends_on:
+      web: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  pgdata:

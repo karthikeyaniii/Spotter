@@ -1,5 +1,4 @@
 """Tests for the architecture-review fixes."""
-import time
 from unittest.mock import patch
 
 from django.core.cache import cache
@@ -101,3 +100,68 @@ class NotFoundTests(TestCase):
         resp = self.client.get("/api/does-not-exist/")
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.json()["error"], "Not found")
+
+
+class ReadinessTests(TestCase):
+    def test_not_ready_without_station_data(self):
+        FuelStation.objects.all().delete()
+        resp = self.client.get(reverse("fuel:health"))
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.json()["status"], "degraded")
+
+
+class PlanCacheTests(TestCase):
+    def setUp(self):
+        cache.clear()
+
+    @patch("fuel.services.planner.get_route", side_effect=fake_route)
+    def test_identical_requests_are_served_from_the_plan_cache(self, route):
+        q = {"start": "Dallas, TX", "finish": "Denver, CO", "include_geometry": "false"}
+        first = self.client.get(reverse("fuel:route"), q).json()
+        second = self.client.get(reverse("fuel:route"), {**q, "start": "dallas tx"}).json()
+        self.assertEqual(first["timings"]["plan_cache"], "miss")
+        self.assertEqual(second["timings"]["plan_cache"], "hit")
+        self.assertEqual(route.call_count, 1)
+        self.assertEqual(second["summary"], first["summary"])
+        self.assertEqual(second["start"]["query"], "dallas tx")  # per-request fields are fresh
+
+    @patch("fuel.services.planner.get_route", side_effect=fake_route)
+    def test_reloading_station_data_invalidates_cached_plans(self, route):
+        q = {"start": "Dallas, TX", "finish": "Denver, CO", "include_geometry": "false"}
+        self.client.get(reverse("fuel:route"), q)
+        FuelStation.objects.create(opis_id=999999, name="New", city="X", state="TX", retail_price="1.0",
+                                   min_price="1.0", max_price="1.0", latitude=33.0, longitude=-100.0)
+        with patch.object(stations, "FINGERPRINT_TTL", 0.0):
+            again = self.client.get(reverse("fuel:route"), q).json()
+        self.assertEqual(again["timings"]["plan_cache"], "miss")
+
+
+class AtomicThrottleTests(TestCase):
+    def setUp(self):
+        cache.clear()
+
+    def test_concurrent_requests_cannot_exceed_the_limit(self):
+        import threading
+
+        from rest_framework.settings import api_settings
+
+        rates = {**api_settings.DEFAULT_THROTTLE_RATES, "places": "10/minute"}
+        codes, lock = [], threading.Lock()
+        barrier = threading.Barrier(25)
+
+        def hit():
+            from django.test import Client
+
+            barrier.wait()
+            code = Client().get(reverse("fuel:places"), {"q": "chi"}).status_code
+            with lock:
+                codes.append(code)
+
+        with patch("rest_framework.throttling.ScopedRateThrottle.THROTTLE_RATES", rates):
+            threads = [threading.Thread(target=hit) for _ in range(25)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertEqual(codes.count(200), 10)  # exactly the limit, never more
+        self.assertEqual(codes.count(429), 15)

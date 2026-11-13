@@ -9,7 +9,7 @@ Give it a **start** and a **finish** anywhere in the USA. It returns:
 using the supplied truck‑stop price list (`data/fuel-prices-for-be-assessment.csv`) and free,
 key‑less map services.
 
-![Stack](https://img.shields.io/badge/Django-6.1-0C4B33) ![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)
+![Stack](https://img.shields.io/badge/Django-6.1-0C4B33) ![Tests](https://img.shields.io/badge/tests-53%20passing-brightgreen)
 
 ---
 
@@ -195,25 +195,64 @@ Everything works with no configuration for local use. Optional environment varia
 * Django: `DJANGO_DEBUG`, `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS`,
   `DJANGO_CSRF_TRUSTED_ORIGINS`, `DJANGO_CACHE_DIR`, `DJANGO_HSTS_PRELOAD`, `LOG_LEVEL`.
 
-## Production
+## Production deployment
 
-```bash
-docker build -t fuel-route-planner .
-docker run -p 8000:8000 -e DJANGO_SECRET_KEY=<random> -e DJANGO_ALLOWED_HOSTS=your.domain fuel-route-planner
+```
+client ─► nginx ─► web × 3 replicas (gunicorn, 4 sync workers each) ─► PostgreSQL (pooled)
+          load balancer, edge rate limit,                           └► Redis (shared cache)
+          gzip, retries, request IDs
+migrate: one-shot job before web starts (replicas never race on migrations)
 ```
 
-The image runs gunicorn with WhiteNoise for static files and runs `migrate` (which loads the
-price list) on start. With `DJANGO_DEBUG=0` the app refuses to start without
-`DJANGO_SECRET_KEY` and turns on HTTPS redirects, HSTS and secure cookies; it passes
-`manage.py check --deploy`. CI (`.github/workflows/ci.yml`) runs the Django checks, a
-migrations check, the test suite and the deploy checklist on every push.
+```bash
+cp .env.production.example .env      # then fill in DJANGO_SECRET_KEY and POSTGRES_PASSWORD
+docker compose up -d --build         # http://localhost:8080
+docker compose up -d --scale web=5   # scale out; nginx re-resolves replicas every 10 s
+docker compose logs -f web           # plain-text logs; each line carries the request ID
+```
+
+**What makes it scale and stay correct under concurrency**
+
+| Concern | How it is handled |
+|---|---|
+| Stateless web tier | All shared state lives in PostgreSQL and Redis, so any replica can serve any request. |
+| CPU parallelism | Gunicorn **sync** workers, about 2 per CPU, one math thread each. Measured: threads only added GIL contention, and threaded workers holding keep‑alive connections queued requests behind busy workers. |
+| Load balancing | nginx `least_conn` across replicas, discovered through Docker DNS. |
+| Public map APIs (1 request/second) | A cluster‑wide slot in Redis (`SET NX PX`) spaces calls across every process and replica; falls back to a per‑process limiter if Redis is down. |
+| Thundering herd | **Single‑flight**: concurrent requests for the same uncached route wait for one fetch (50 simultaneous requests across 3 replicas made exactly 1 OSRM call). "No road route" answers are cached too. |
+| Hot paths | Whole plans are cached in Redis, keyed by coordinates, vehicle settings and the station‑data version, so a price reload never serves stale plans. |
+| Abuse | nginx per‑IP limit (20 r/s, burst 40) at the edge, plus an atomic per‑client counter in the app (30 plans/min). The default DRF throttle loses updates under concurrency; this one admits exactly the limit (tested with 25 parallel requests against a limit of 10). |
+| Database | PostgreSQL with a psycopg connection pool per process; migrations and data load run once in their own job. |
+| Failure handling | Liveness (`/api/health/live/`) and readiness (`/api/health/`, checks DB, cache, data; 503 when degraded) probes; nginx retries idempotent requests on another replica; workers are recycled after ~2,000 requests; graceful shutdown drains in‑flight requests. |
+| Security | Non‑root container, secrets only from the environment, refuses to start with a weak key, HTTPS/HSTS settings, passes `check --deploy`. |
+
+**Measured on this stack** (one 8‑core laptop running nginx, 3 replicas, Postgres, Redis and
+the k6 load generator together; `deploy/loadtest/k6-mixed.js`, 64 concurrent users, 70 %
+route plans, 20 % suggestions, 10 % health checks):
+
+| Scenario | Result |
+|---|---|
+| Steady state, 3 warm replicas | ~225 req/s, p95 423 ms, p99 498 ms, **0 errors** out of 6,848 |
+| One replica (2 CPUs) alone | ~160 req/s, p95 593 ms, 0 errors |
+| Replica hard‑killed + one worker killed mid‑load | 1 failed request out of 4,907 (0.02 %); retry budget raised afterwards |
+| Replica gracefully restarted mid‑load (as in a deploy) | **0 errors** out of 6,493; container restarted itself |
+| 300‑request burst from one IP | 41 admitted, 259 rejected at nginx (never reached Django) |
+
+On this machine the load generator, load balancer and databases share the same 8 cores, so
+adding replicas beyond three adds little; on separate hosts each replica adds roughly its own
+~160 req/s. Re‑run the tests with the commands at the top of `deploy/loadtest/k6-mixed.js`
+(raise `THROTTLE_*` and `NGINX_API_RATE` for the run, since all traffic comes from one IP).
+
+A single container also works: `docker run -p 8000:8000 -e RUN_MIGRATIONS=1
+-e DJANGO_SECRET_KEY=<random> fuel-route-planner` (SQLite, file cache).
 
 ## Design decisions and known limits
 
-* **Public map services.** OSRM and Nominatim demo servers allow 1 request per second. Calls
-  are spaced per host inside each process, the API is throttled per client, and most inputs
-  never reach them (offline cities, caches). For real traffic, set `OSRM_BASE_URL` /
-  `NOMINATIM_BASE_URL` to self‑hosted instances; the limiter is per process.
+* **Public map services.** The OSRM and Nominatim demo servers allow 1 request per second,
+  enforced here cluster‑wide. Cached and repeat trips never touch them, but brand‑new routes
+  are capped at about one per second for the whole deployment. For real traffic, point
+  `OSRM_BASE_URL` / `NOMINATIM_BASE_URL` at self‑hosted instances and lower the interval in
+  `MIN_SECONDS_BETWEEN_CALLS`.
 * **Station positions are city‑level.** The price file has no coordinates, so a station is
   placed at its town; the 10‑mile corridor absorbs that. Detour distance is reported but not
   charged as fuel.
@@ -246,9 +285,12 @@ fuel/
   migrations/0002_...       loads the price list on migrate
   management/commands/      load_fuel_prices, geocode_station_cities
   templates/fuel/map.html   the map page (Leaflet)
-  tests/                    43 tests; the network is blocked inside tests
+  tests/                    53 tests (incl. concurrency); the network is blocked inside tests
 data/                       price CSV, station coordinates, US place list
-Dockerfile, .github/        production image and CI
+Dockerfile, gunicorn.conf.py production image and server settings
+docker-compose.yml          nginx + web replicas + PostgreSQL + Redis + migrate job
+deploy/                     nginx config, entrypoint, k6 load tests
+.github/                    CI
 postman/                    Postman collection
 scripts/                    one-off data builders (Census + Nominatim)
 ```

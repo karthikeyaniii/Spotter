@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import numpy as np
+from django.core.cache import cache
 from django.test import TestCase
 from django.urls import reverse
 
@@ -40,6 +41,7 @@ def lon_at_mile(mile):
 
 class RouteApiTests(TestCase):
     def setUp(self):
+        cache.clear()  # no plan/route cache carried over between tests
         FuelStation.objects.all().delete()  # the data migration loaded the real list; use fixtures
         FuelStation.objects.bulk_create(
             [
@@ -111,8 +113,12 @@ class RouteApiTests(TestCase):
     def test_health(self):
         resp = self.client.get(reverse("fuel:health"))
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["stations_loaded"], 4)
-        self.assertEqual(resp.json()["stations_with_coordinates"], 3)
+        body = resp.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["checks"]["stations"]["with_coordinates"], 3)
+        self.assertTrue(body["checks"]["database"]["ok"])
+        self.assertTrue(body["checks"]["cache"]["ok"])
+        self.assertEqual(self.client.get(reverse("fuel:live")).json()["status"], "alive")
 
     def test_map_page_renders(self):
         resp = self.client.get("/", {"start": "Chicago, IL", "finish": "Atlanta, GA"})
@@ -193,6 +199,7 @@ class OfflinePlacesTests(TestCase):
 
 class RouteApiExtraTests(TestCase):
     def setUp(self):
+        cache.clear()  # no plan/route cache carried over between tests
         FuelStation.objects.all().delete()
         FuelStation.objects.create(opis_id=1, name="Cheap Stop", city="A", state="TX", retail_price="3.000",
                                    min_price="3.0", max_price="3.0", latitude=35.0, longitude=lon_at_mile(250))

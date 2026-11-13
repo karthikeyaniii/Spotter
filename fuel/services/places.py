@@ -154,6 +154,8 @@ _index = None
 
 def get_place_index():
     global _index
+    if _index is not None:  # fast path: no lock once loaded (hot on every request)
+        return _index
     with _lock:
         if _index is None:
             _index = PlaceIndex.from_csv(settings.FUEL_ROUTE["US_PLACES_CSV"])

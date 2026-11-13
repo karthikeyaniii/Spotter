@@ -1,15 +1,18 @@
 """Orchestrates geocoding -> routing -> station lookup -> fuel optimisation."""
+import hashlib
+import json
 import time
 from urllib.parse import urlencode
 
 import numpy as np
 from django.conf import settings
+from django.core.cache import cache
 
 from .geo import haversine_miles, thin_polyline
 from .geocoding import geocode
 from .optimizer import plan_fuel_stops
 from .routing import get_route
-from .stations import get_station_index
+from .stations import get_station_index, station_data_version
 
 # Start and finish closer than this are treated as the same place.
 SAME_PLACE_MILES = 1.0
@@ -17,6 +20,21 @@ SAME_PLACE_MILES = 1.0
 
 class TripError(ValueError):
     """The request is valid input but not a plannable trip (e.g. start == finish)."""
+
+
+def _plan_cache_key(origin, destination, params):
+    """Same coordinates + same vehicle settings + same station data => same plan."""
+    raw = json.dumps(
+        {
+            "a": [round(origin.latitude, 5), round(origin.longitude, 5)],
+            "b": [round(destination.latitude, 5), round(destination.longitude, 5)],
+            "p": params,
+            "stations": station_data_version(),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return "plan:" + hashlib.sha1(raw.encode()).hexdigest()
 
 
 def plan_trip(start, finish, *, vehicle_range_miles=None, mpg=None, initial_range_miles=None,
@@ -40,6 +58,19 @@ def plan_trip(start, finish, *, vehicle_range_miles=None, mpg=None, initial_rang
         raise TripError(f"'{start}' and '{finish}' are the same place. Please choose two different locations.")
     t1 = time.perf_counter()
     timings["geocoding_ms"] = round((t1 - t0) * 1000, 1)
+
+    # Whole-plan cache: popular trips are served without re-running routing or optimisation.
+    params = [vehicle_range_miles, mpg, initial_range_miles, max_detour_miles, stop_penalty_usd, bool(include_geometry)]
+    plan_key = _plan_cache_key(origin, destination, params)
+    cached = cache.get(plan_key)
+    if cached is not None:
+        result = dict(cached)
+        result["start"], result["finish"] = origin.as_dict(), destination.as_dict()
+        result["map_url"] = f"{base_url}/?{urlencode({'start': start, 'finish': finish})}"
+        result["external_api_calls"] = calls
+        result["timings"] = {**timings, "plan_cache": "hit"}
+        result["processing_time_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        return result
 
     route = get_route(origin.latitude, origin.longitude, destination.latitude, destination.longitude, counter=calls)
     t2 = time.perf_counter()
@@ -67,7 +98,7 @@ def plan_trip(start, finish, *, vehicle_range_miles=None, mpg=None, initial_rang
     if include_geometry:
         geometry = {"type": "LineString", "coordinates": thin_polyline(route.coordinates, cfg["MAX_GEOMETRY_POINTS"])}
 
-    return {
+    result = {
         "start": origin.as_dict(),
         "finish": destination.as_dict(),
         "route": {
@@ -111,9 +142,12 @@ def plan_trip(start, finish, *, vehicle_range_miles=None, mpg=None, initial_rang
         },
         "map_url": f"{base_url}/?{urlencode({'start': start, 'finish': finish})}",
         "external_api_calls": calls,
-        "timings": timings,
+        "timings": {**timings, "plan_cache": "miss"},
         "processing_time_ms": round((time.perf_counter() - t0) * 1000, 1),
     }
+    if plan.feasible:
+        cache.set(plan_key, result, cfg["PLAN_CACHE_SECONDS"])
+    return result
 
 
 def to_geojson(result):

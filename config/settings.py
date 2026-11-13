@@ -33,10 +33,13 @@ INSTALLED_APPS = [
     "fuel",
 ]
 
+# Compression: behind nginx (DJANGO_NUM_PROXIES > 0) nginx gzips in C, outside the app
+# workers; serving directly (local development) Django does it.
+_GZIP_IN_DJANGO = not int(os.environ.get("DJANGO_NUM_PROXIES") or 0)
+
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",  # static files without a separate web server
-    "django.middleware.gzip.GZipMiddleware",  # route geometry compresses ~4x
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -45,6 +48,9 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
+
+if _GZIP_IN_DJANGO:
+    MIDDLEWARE.insert(2, "django.middleware.gzip.GZipMiddleware")  # after WhiteNoise
 
 ROOT_URLCONF = "config.urls"
 
@@ -65,12 +71,23 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
+# SQLite for local development; set DATABASE_URL (e.g. postgres://user:pass@host:5432/db)
+# for production. PostgreSQL uses a per-process connection pool (gunicorn threads share it).
+import dj_database_url  # noqa: E402
+
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
+    "default": dj_database_url.parse(
+        os.environ.get("DATABASE_URL") or f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
+        conn_health_checks=True,
+    )
 }
+if DATABASES["default"]["ENGINE"] == "django.db.backends.postgresql":
+    DATABASES["default"]["CONN_MAX_AGE"] = 0  # pooling replaces persistent connections
+    DATABASES["default"].setdefault("OPTIONS", {})["pool"] = {
+        "min_size": int(os.environ.get("DB_POOL_MIN") or 2),
+        "max_size": int(os.environ.get("DB_POOL_MAX") or 10),
+        "timeout": 10,
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -117,31 +134,47 @@ SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [
-        "rest_framework.renderers.JSONRenderer",
+        "fuel.renderers.ORJSONRenderer",
         "rest_framework.renderers.BrowsableAPIRenderer",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
     # Public API, no sessions: also avoids CSRF failures on POST for logged-in admin users.
     "DEFAULT_AUTHENTICATION_CLASSES": [],
     # Each new route can trigger calls to free public services; cap per-client usage.
-    "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.ScopedRateThrottle"],
+    "DEFAULT_THROTTLE_CLASSES": ["fuel.throttling.FixedWindowScopedThrottle"],
     "DEFAULT_THROTTLE_RATES": {
         "route": (os.environ.get("THROTTLE_ROUTE") or "30/minute"),
         "places": (os.environ.get("THROTTLE_PLACES") or "240/minute"),
     },
     "EXCEPTION_HANDLER": "fuel.exceptions.api_exception_handler",
+    # Behind nginx: take the client IP from X-Forwarded-For (one trusted proxy) so
+    # throttling is per real client, not per load balancer.
+    "NUM_PROXIES": int(os.environ.get("DJANGO_NUM_PROXIES") or 0) or None,
 }
 
-# File cache: routes and throttle counters survive restarts and are shared by
-# worker processes on the same host (use Redis/Memcached for several hosts).
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
-        "LOCATION": os.environ.get("DJANGO_CACHE_DIR") or str(BASE_DIR / ".cache"),
-        "TIMEOUT": 60 * 60 * 24 * 7,
-        "OPTIONS": {"MAX_ENTRIES": 5000},
+# Shared cache for routes, API throttle counters, single-flight locks and the
+# cross-instance limiter for the public map APIs.
+# * REDIS_URL set (production): Redis, shared by every process on every host.
+# * otherwise: a file cache, shared by the processes of one machine.
+REDIS_URL = os.environ.get("REDIS_URL") or ""
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "TIMEOUT": 60 * 60 * 24 * 7,
+            "KEY_PREFIX": "fuel",
+        }
     }
-}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+            "LOCATION": os.environ.get("DJANGO_CACHE_DIR") or str(BASE_DIR / ".cache"),
+            "TIMEOUT": 60 * 60 * 24 * 7,
+            "OPTIONS": {"MAX_ENTRIES": 5000},
+        }
+    }
 
 # ---------------------------------------------------------------------------
 # Fuel route planner configuration
@@ -176,6 +209,9 @@ FUEL_ROUTE = {
         "nominatim.openstreetmap.org": 1.0,
         "router.project-osrm.org": 1.0,
     },
+    # Identical trip requests are answered from cache for this long (prices are static per load;
+    # reloading prices changes the cache key, so stale plans are never served).
+    "PLAN_CACHE_SECONDS": int(os.environ.get("PLAN_CACHE_SECONDS") or 600),
     # Max points of route geometry returned in the API response (thinned for payload size).
     "MAX_GEOMETRY_POINTS": int(os.environ.get("MAX_GEOMETRY_POINTS") or 2500),
 }

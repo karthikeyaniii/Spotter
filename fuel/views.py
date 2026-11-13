@@ -1,7 +1,11 @@
 import logging
+import time
+import uuid
 from urllib.parse import urlencode
 
 from django.conf import settings
+from django.core.cache import cache, caches
+from django.db import connection
 from django.shortcuts import render
 from django.urls import reverse
 from rest_framework import serializers, status
@@ -113,17 +117,50 @@ class PlaceSuggestView(APIView):
         return Response({"query": q, "results": [p.as_dict() for p in get_place_index().suggest(q, limit)]})
 
 
-class HealthView(APIView):
+class LivenessView(APIView):
+    """GET /api/health/live/ -> 200 while the process can serve requests (no dependencies)."""
+
+    throttle_classes = []
+
     def get(self, request):
-        total = FuelStation.objects.count()
-        located = FuelStation.objects.filter(latitude__isnull=False).count()
-        return Response(
-            {
-                "status": "ok" if located else "no-station-data",
-                "stations_loaded": total,
-                "stations_with_coordinates": located,
-            }
-        )
+        return Response({"status": "alive"})
+
+
+class HealthView(APIView):
+    """
+    GET /api/health/ -> readiness: database, cache and station data.
+    503 if any check fails, so a load balancer only routes to working replicas.
+    """
+
+    throttle_classes = []
+
+    def get(self, request):
+        checks, ok = {}, True
+        t = time.perf_counter()
+        try:
+            with connection.cursor() as cur:
+                cur.execute("SELECT 1")
+            located = FuelStation.objects.filter(latitude__isnull=False).count()
+            checks["database"] = {"ok": True, "ms": round((time.perf_counter() - t) * 1000, 1)}
+            checks["stations"] = {"ok": located > 0, "with_coordinates": located}
+            ok &= located > 0
+        except Exception as exc:  # noqa: BLE001 - report, don't crash the probe
+            checks["database"] = {"ok": False, "error": exc.__class__.__name__}
+            ok = False
+        t = time.perf_counter()
+        try:
+            probe = f"health:{uuid.uuid4().hex}"
+            cache.set(probe, "1", 10)
+            cache_ok = cache.get(probe) == "1"
+            cache.delete(probe)
+            checks["cache"] = {"ok": cache_ok, "backend": caches["default"].__class__.__name__,
+                               "ms": round((time.perf_counter() - t) * 1000, 1)}
+            ok &= cache_ok
+        except Exception as exc:  # noqa: BLE001
+            checks["cache"] = {"ok": False, "error": exc.__class__.__name__}
+            ok = False
+        body = {"status": "ok" if ok else "degraded", "checks": checks}
+        return Response(body, status=status.HTTP_200_OK if ok else status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
 class ApiRootView(APIView):

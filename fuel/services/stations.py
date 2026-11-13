@@ -139,6 +139,11 @@ def _db_fingerprint():
 
 def get_station_index(force_reload=False):
     global _index, _fingerprint, _checked_at
+    # Fast path without the lock: the index is immutable once built, and the fingerprint
+    # only needs re-checking every FINGERPRINT_TTL seconds.
+    index = _index
+    if index is not None and not force_reload and time.monotonic() - _checked_at < FINGERPRINT_TTL:
+        return index
     with _lock:
         now = time.monotonic()
         if _index is not None and not force_reload and now - _checked_at < FINGERPRINT_TTL:
@@ -149,6 +154,12 @@ def get_station_index(force_reload=False):
             _index = StationIndex.from_db()
             _fingerprint = fp
         return _index
+
+
+def station_data_version():
+    """Fingerprint of the station data the current index was built from (for cache keys)."""
+    get_station_index()
+    return _fingerprint
 
 
 def invalidate_station_index():

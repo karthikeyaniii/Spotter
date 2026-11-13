@@ -11,7 +11,7 @@
       "name": "1. Health",
       "event": [{ "listen": "test", "script": { "exec": [
         "pm.test('200 OK', () => pm.response.to.have.status(200));",
-        "pm.test('stations loaded', () => pm.expect(pm.response.json().stations_with_coordinates).to.be.above(6000));"
+        "pm.test('stations loaded', () => pm.expect(pm.response.json().checks.stations.with_coordinates).to.be.above(6000));"
       ] } }],
       "request": { "method": "GET", "url": "{{baseUrl}}/api/health/" }
     },
